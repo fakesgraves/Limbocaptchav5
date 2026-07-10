@@ -1,0 +1,96 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Если в корне репозитория лежит zip-архив с сурсами плагина (например,
+      # limbocaptcha.zip, скачанный отсюда и просто закинутый в репозиторий
+      # без ручной распаковки) - этот шаг сам его распакует перед сборкой.
+      # Если корень репозитория уже содержит src/ и pom.xml напрямую (без
+      # архива) - шаг ничего не делает и просто пропускается.
+      - name: Распаковать архив с сурсами (если есть)
+        run: |
+          shopt -s nullglob
+          archives=(*.zip)
+
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "Zip-архивов в корне репозитория не найдено, пропускаем распаковку."
+            exit 0
+          fi
+
+          for archive in "${archives[@]}"; do
+            echo "Найден архив: $archive"
+            tmp_dir=$(mktemp -d)
+            unzip -q "$archive" -d "$tmp_dir"
+
+            # Архив может содержать либо файлы сразу в корне (pom.xml, src/...),
+            # либо всё завёрнуто в одну общую папку (например limbocaptcha/pom.xml) -
+            # обрабатываем оба варианта и копируем содержимое в корень репозитория.
+            entries=("$tmp_dir"/*)
+            if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
+              echo "Архив содержит одну корневую папку: $(basename "${entries[0]}") - разворачиваю её содержимое."
+              cp -rn "${entries[0]}"/. .
+            else
+              cp -rn "$tmp_dir"/. .
+            fi
+
+            rm -rf "$tmp_dir"
+            echo "Архив $archive распакован."
+          done
+
+          echo "Итоговое содержимое корня репозитория:"
+          ls -la
+
+      - name: Проверить, что pom.xml найден
+        run: |
+          if [ ! -f "pom.xml" ]; then
+            echo "::error::pom.xml не найден ни в репозитории, ни после распаковки архива."
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build with Maven
+        run: mvn -B clean package --file pom.xml
+
+      - name: Locate built jar
+        id: jar
+        run: |
+          JAR_PATH=$(find target -maxdepth 1 -name "*.jar" ! -name "original-*.jar" | head -n 1)
+          echo "path=$JAR_PATH" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$JAR_PATH")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.jar.outputs.name }}
+          path: ${{ steps.jar.outputs.path }}
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.jar.outputs.path }}
+          generate_release_notes: true
